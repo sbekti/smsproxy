@@ -1,0 +1,10 @@
+hash: 002aac8694314d5537acfeb0872c0cf4c0f0b236ddb464a13f67f72c2378a5d7
+updated: 2018-07-05T10:10:35.640372-07:00
+imports:
+- name: github.com/gorilla/context
+  version: 08b5f424b9271eedf6f9f0ce86cb9396ed337a42
+- name: github.com/gorilla/mux
+  version: e3702bed27f0d39777b0b37b664b6280e8ef8fbf
+- name: github.com/urfave/cli
+  version: 8e01ec4cd3e2d84ab2fe90d8210528ffbb06d8ff
+testImports: []
