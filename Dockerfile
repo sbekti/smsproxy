@@ -8,7 +8,7 @@ WORKDIR /build
 # Let's cache modules retrieval - those don't change so often
 # COPY go.mod .
 # COPY go.sum .
-RUN go mod init smsproxy
+RUN go mod init github.com/sbekti/smsproxy
 RUN go mod download
 
 # Copy the code necessary to build the application

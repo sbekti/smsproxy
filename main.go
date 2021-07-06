@@ -1,10 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,135 +14,347 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ses"
+	"github.com/jhillyerd/enmime"
+	"github.com/kvannotten/mailstrip"
+	log "github.com/sirupsen/logrus"
+
 	"github.com/gorilla/mux"
 	"github.com/urfave/cli"
 )
 
 var (
-	port           int
-	expectedSecret string
-	email          string
-	domain         string
-	gsmTrunk       string
-	gsmPort        string
-	gsmUsername    string
-	gsmPassword    string
-	mailgunUrl     string
-	mailgunAPIKey  string
+	port               int
+	expectedSecret     string
+	emailMapping       string
+	baseDomain         string
+	gsmTrunk           string
+	gsmUsername        string
+	gsmPassword        string
+	awsAccessKeyID     string
+	awsSecretAccessKey string
+	awsRegion          string
+	logLevel           string
+
+	emailToGSMPortMap map[string]string
+	gsmPortToEmailMap map[string]string
 )
 
-func index(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "hello from smsproxy")
+type SNSMessage struct {
+	Type             string    `json:"Type"`
+	MessageID        string    `json:"MessageId"`
+	Token            string    `json:"Token"`
+	TopicArn         string    `json:"TopicArn"`
+	Message          string    `json:"Message"`
+	SubscribeURL     string    `json:"SubscribeURL"`
+	Timestamp        time.Time `json:"Timestamp"`
+	SignatureVersion string    `json:"SignatureVersion"`
+	Signature        string    `json:"Signature"`
+	SigningCertURL   string    `json:"SigningCertURL"`
 }
 
-func sendMessage(w http.ResponseWriter, r *http.Request) {
+type SESMessage struct {
+	NotificationType string `json:"notificationType"`
+	Mail             struct {
+		Timestamp        time.Time `json:"timestamp"`
+		Source           string    `json:"source"`
+		MessageID        string    `json:"messageId"`
+		Destination      []string  `json:"destination"`
+		HeadersTruncated bool      `json:"headersTruncated"`
+		Headers          []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"headers"`
+		CommonHeaders struct {
+			ReturnPath string   `json:"returnPath"`
+			From       []string `json:"from"`
+			Date       string   `json:"date"`
+			To         []string `json:"to"`
+			MessageID  string   `json:"messageId"`
+			Subject    string   `json:"subject"`
+		} `json:"commonHeaders"`
+	} `json:"mail"`
+	Receipt struct {
+		Timestamp            time.Time `json:"timestamp"`
+		ProcessingTimeMillis int       `json:"processingTimeMillis"`
+		Recipients           []string  `json:"recipients"`
+		SpamVerdict          struct {
+			Status string `json:"status"`
+		} `json:"spamVerdict"`
+		VirusVerdict struct {
+			Status string `json:"status"`
+		} `json:"virusVerdict"`
+		SpfVerdict struct {
+			Status string `json:"status"`
+		} `json:"spfVerdict"`
+		DkimVerdict struct {
+			Status string `json:"status"`
+		} `json:"dkimVerdict"`
+		DmarcVerdict struct {
+			Status string `json:"status"`
+		} `json:"dmarcVerdict"`
+		Action struct {
+			Type     string `json:"type"`
+			TopicArn string `json:"topicArn"`
+			Encoding string `json:"encoding"`
+		} `json:"action"`
+	} `json:"receipt"`
+	Content string `json:"content"`
+}
+
+type UnauthorizedSenderError struct {
+	Sender string
+}
+
+func (e *UnauthorizedSenderError) Error() string {
+	return fmt.Sprintf("unauthorized sender: %s", e.Sender)
+}
+
+func index(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "hello from smsproxy 3.0")
+}
+
+func doPostMessage(w http.ResponseWriter, r *http.Request) {
 	secret := r.URL.Query().Get("secret")
 	if secret == "" || secret != expectedSecret {
-		fmt.Printf("Received sendMessage request with invalid secret: %s\n", secret)
+		log.Errorf("doPostMessage: request has invalid secret: %s\n", secret)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
-	r.ParseMultipartForm(0)
-
-	sender := r.FormValue("sender")
-	if sender == "" || sender != email {
-		fmt.Printf("Received sendMessage request with invalid sender: %s\n", sender)
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	recipient := r.FormValue("recipient")
-	recipient = strings.Split(recipient, "@")[0]
-
-	content := r.FormValue("stripped-text")
-	re := regexp.MustCompile(`\r?\n`)
-	content = re.ReplaceAllString(content, " ")
-
-	fmt.Printf("Received sendMessage request: %s %s %s\n", recipient, sender, content)
-
-	escapedContent := url.QueryEscape(content)
-	query := fmt.Sprintf("/sendsms?username=%s&password=%s&port=%s&phonenumber=%s&message=%s",
-		gsmUsername, gsmPassword, gsmPort, recipient, escapedContent)
-
-	fmt.Printf("Sending query: %s", gsmTrunk+query)
-	req, err := http.NewRequest("GET", gsmTrunk+query, nil)
-
-	client := &http.Client{
-		Timeout: time.Second * 30,
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		errMsg := fmt.Sprintf("%s", err)
-		fmt.Println(errMsg)
-		sendErrorMail(sender, recipient, content, errMsg)
+	switch snsMessageType := r.Header.Get("X-Amz-Sns-Message-Type"); snsMessageType {
+	case "SubscriptionConfirmation":
+		var snsMessage SNSMessage
+		err := json.NewDecoder(r.Body).Decode(&snsMessage)
+		if err != nil {
+			log.Errorf("doPostMessage: error while parsing SNS message body: %s\n", err)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		err = confirmSNSSubscription(snsMessage.SubscribeURL)
+		if err != nil {
+			log.Errorf("doPostMessage: failed to subscribe to SNS topic: %s\n", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		log.Infof("subscribed to SNS topic: %s\n", snsMessage.TopicArn)
 		w.WriteHeader(http.StatusOK)
 		return
+	case "Notification":
+		var sesMessage SESMessage
+		err := json.NewDecoder(r.Body).Decode(&sesMessage)
+		if err != nil {
+			log.Errorf("doPostMessage: error while parsing SES message body: %s\n", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = sendTextMessage(sesMessage)
+		if err != nil {
+			log.Errorf("doPostMessage: failed to send text message: %s\n", err)
+
+			switch err.(type) {
+			case *UnauthorizedSenderError:
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			default:
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	case "":
+		log.Errorf("doPostMessage: received request with no SNS message type")
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	default:
+		log.Errorf("doPostMessage: received request with an unknown SNS message type: %s\n", snsMessageType)
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
-	defer resp.Body.Close()
-
-	fmt.Println("response Status:", resp.Status)
-	fmt.Println("response Headers:", resp.Header)
-	body, _ := ioutil.ReadAll(resp.Body)
-	fmt.Println("response Body:", string(body))
-
-	fmt.Fprintf(w, "done!")
 }
 
-func receiveMessage(w http.ResponseWriter, r *http.Request) {
+func doGetMessage(w http.ResponseWriter, r *http.Request) {
 	secret := r.URL.Query().Get("secret")
 	if secret == "" || secret != expectedSecret {
-		fmt.Printf("Received receiveMessage request with invalid secret: %s\n", secret)
+		log.Errorf("doGetMessage: request has invalid secret: %s\n", secret)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	phoneNumber := r.URL.Query().Get("phonenumber")
-	port := r.URL.Query().Get("port")
+	gsmPort := r.URL.Query().Get("port")
 	message := r.URL.Query().Get("message")
 	time := r.URL.Query().Get("time")
 
-	from := fmt.Sprintf("%s@%s", phoneNumber, domain)
-	subject := fmt.Sprintf("Incoming SMS from %s", phoneNumber)
-	text := fmt.Sprintf("%s - %s - %s", time, port, message)
-	
-	fmt.Printf("Sending email: %s %s %s %s\n", from, email, subject, text)
-	sendMail(from, email, subject, text)
-}
-
-func sendErrorMail(to string, recipient string, content string, errMsg string) {
-	subject := fmt.Sprintf("SMS Sending Failure: %s", recipient)
-	text := fmt.Sprintf("Failed to send SMS to %s\n\nContent: %s\n\nReason: %s", recipient, content, errMsg)
-	sendMail(domain, to, subject, text)
-}
-
-func sendMail(from string, to string, subject string, text string) {
-	data := url.Values{}
-	data.Add("from", from)
-	data.Add("to", to)
-	data.Add("subject", subject)
-	data.Add("text", text)
-
-	req, err := http.NewRequest("POST", mailgunUrl, strings.NewReader(data.Encode()))
-	req.Header.Add("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(mailgunAPIKey)))
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
-
-	client := &http.Client{
-		Timeout: time.Second * 30,
+	if _, ok := gsmPortToEmailMap[gsmPort]; !ok {
+		log.Errorf("doGetMessage: request has unmapped gsm port: %s\n", gsmPort)
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
+	to := gsmPortToEmailMap[gsmPort]
+	from := fmt.Sprintf("%s@%s", phoneNumber, baseDomain)
+	subject := fmt.Sprintf("Incoming SMS from %s", phoneNumber)
+	text := fmt.Sprintf("%s - %s - %s", time, gsmPort, message)
+
+	log.Infof("doGetMessage: sending email: %s %s %s %s\n", from, to, subject, text)
+	if err := sendMail(from, to, subject, text); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+}
+
+func getHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: time.Second * 30,
+	}
+}
+
+func confirmSNSSubscription(url string) error {
+	client := getHTTPClient()
+	_, err := client.Get(url)
+	if err != nil {
+		log.Errorf("confirmSNSSubscription: error while accessing subscription URL %s: %s\n", url, err)
+		return err
+	}
+	return nil
+}
+
+func sendTextMessage(sesMessage SESMessage) error {
+	senderAddr := sesMessage.Mail.Source
+	if _, ok := emailToGSMPortMap[senderAddr]; !ok {
+		return &UnauthorizedSenderError{Sender: senderAddr}
+	}
+
+	destAddr := sesMessage.Mail.Destination[0]
+	destNumber := strings.Split(destAddr, "@")[0]
+	gsmPort := emailToGSMPortMap[senderAddr]
+
+	rawEmail, err := base64.StdEncoding.DecodeString(sesMessage.Content)
+	if err != nil {
+		return fmt.Errorf("sendTextMessage: unable to decode content")
+	}
+
+	// Strip all quoted replies and get the actual text content.
+	env, _ := enmime.ReadEnvelope(bytes.NewReader(rawEmail))
+	content := mailstrip.Parse(env.Text).String()
+
+	// Strip all newlines.
+	re := regexp.MustCompile(`\r?\n`)
+	content = re.ReplaceAllString(content, " ")
+
+	log.Infof("sendTextMessage: outgoing SMS: %s %s %s %s\n", senderAddr, destNumber, gsmPort, content)
+
+	escapedContent := url.QueryEscape(content)
+	query := fmt.Sprintf("/sendsms?username=%s&password=%s&port=%s&phonenumber=%s&message=%s",
+		gsmUsername, gsmPassword, gsmPort, destNumber, escapedContent)
+
+	log.Debugf("sendTextMessage: sending query: %s", gsmTrunk+query)
+	req, err := http.NewRequest("GET", gsmTrunk+query, nil)
+
+	client := getHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("%s\n", err)
-		return
+		sendErrorMail(senderAddr, destNumber, gsmPort, content, err.Error())
+		return fmt.Errorf("sendTextMessage: unable to send query to GSM trunk: %s\n", err)
 	}
 	defer resp.Body.Close()
 
-	fmt.Println("response Status:", resp.Status)
-	fmt.Println("response Headers:", resp.Header)
+	log.Debugf("sendTextMessage: response status:", resp.Status)
+	log.Debugf("sendTextMessage: response headers:", resp.Header)
 	body, _ := ioutil.ReadAll(resp.Body)
-	fmt.Println("response Body:", string(body))
+	log.Debugf("sendTextMessage: response body:", string(body))
+	return nil
+}
+
+func processEmailMapping() error {
+	emailToGSMPortMap = make(map[string]string)
+	gsmPortToEmailMap = make(map[string]string)
+
+	pairs := strings.Split(emailMapping, ",")
+	if len(pairs) == 1 && pairs[0] == "" {
+		return fmt.Errorf("processEmailMapping: cannot have an empty email map")
+	}
+
+	for _, pair := range pairs {
+		parts := strings.Split(pair, ":")
+		if len(parts) != 2 {
+			return fmt.Errorf("processEmailMapping: missing map in entry: \"%s\"\n", pair)
+		}
+
+		email, port := parts[0], parts[1]
+		if email == "" || port == "" {
+			return fmt.Errorf("processEmailMapping: invalid map entry: \"%s\"\n", pair)
+		}
+
+		emailToGSMPortMap[email] = port
+		gsmPortToEmailMap[port] = email
+	}
+
+	log.Debugf("processEmailMapping: email mappings: %+v", emailToGSMPortMap)
+	log.Debugf("processEmailMapping: gsm port mappings: %+v", gsmPortToEmailMap)
+	return nil
+}
+
+func sendErrorMail(senderAddr string, destNumber string, gsmPort string, content string, errMsg string) error {
+	from := "noreply@" + baseDomain
+	subject := fmt.Sprintf("SMS Sending Failure: %s", destNumber)
+	text := fmt.Sprintf("Failed to send SMS to %s\n\nGSM port: %s\nContent: %s\n\nReason: %s",
+		destNumber, gsmPort, content, errMsg)
+
+	if err := sendMail(from, senderAddr, subject, text); err != nil {
+		return err
+	}
+	return nil
+}
+
+func sendMail(from string, to string, subject string, text string) error {
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(awsRegion),
+	})
+
+	svc := ses.New(sess)
+	charset := "UTF-8"
+
+	// Assemble the email.
+	input := &ses.SendEmailInput{
+		Destination: &ses.Destination{
+			CcAddresses: []*string{},
+			ToAddresses: []*string{
+				aws.String(to),
+			},
+		},
+		Message: &ses.Message{
+			Body: &ses.Body{
+				Text: &ses.Content{
+					Charset: aws.String(charset),
+					Data:    aws.String(text),
+				},
+			},
+			Subject: &ses.Content{
+				Charset: aws.String(charset),
+				Data:    aws.String(subject),
+			},
+		},
+		Source: aws.String(from),
+	}
+
+	// Attempt to send the email.
+	result, err := svc.SendEmail(input)
+
+	// Display error messages if they occur.
+	if err != nil {
+		log.Errorf("sendMail: error sending email to %s: %s\n", to, err.Error())
+		return fmt.Errorf("sendMail: error sending email to %s: %s\n", to, err.Error())
+	}
+
+	log.Infof("sendMail: email sent to address: " + to)
+	log.Debugf("sendMail: %+v", result)
+	return nil
 }
 
 func main() {
@@ -163,18 +376,18 @@ func main() {
 			Destination: &expectedSecret,
 		},
 		cli.StringFlag{
-			Name:        "email",
-			Value:       "someone@domain.com",
-			Usage:       "email",
-			EnvVar:      "EMAIL",
-			Destination: &email,
+			Name:        "email-map",
+			Value:       "",
+			Usage:       "email:gsm-port mapping, separated by commas",
+			EnvVar:      "EMAIL_MAPPING",
+			Destination: &emailMapping,
 		},
 		cli.StringFlag{
-			Name:        "domain",
-			Value:       "domain.com",
-			Usage:       "domain",
-			EnvVar:      "DOMAIN",
-			Destination: &domain,
+			Name:        "base-domain",
+			Value:       "example.com",
+			Usage:       "base domain",
+			EnvVar:      "BASE_DOMAIN",
+			Destination: &baseDomain,
 		},
 		cli.StringFlag{
 			Name:        "gsm-trunk",
@@ -182,13 +395,6 @@ func main() {
 			Usage:       "gsm trunk",
 			EnvVar:      "GSM_TRUNK",
 			Destination: &gsmTrunk,
-		},
-		cli.StringFlag{
-			Name:        "gsm-port",
-			Value:       "http://localhost:8081",
-			Usage:       "gsm port",
-			EnvVar:      "GSM_PORT",
-			Destination: &gsmPort,
 		},
 		cli.StringFlag{
 			Name:        "gsm-username",
@@ -205,27 +411,51 @@ func main() {
 			Destination: &gsmPassword,
 		},
 		cli.StringFlag{
-			Name:        "mailgun-url",
+			Name:        "aws-access-key-id",
 			Value:       "",
-			Usage:       "mailgun url",
-			EnvVar:      "MAILGUN_URL",
-			Destination: &mailgunUrl,
+			Usage:       "aws access key id",
+			EnvVar:      "AWS_ACCESS_KEY_ID",
+			Destination: &awsAccessKeyID,
 		},
 		cli.StringFlag{
-			Name:        "mailgun-api-key",
+			Name:        "aws-secret-access-key",
 			Value:       "",
-			Usage:       "mailgun api key",
-			EnvVar:      "MAILGUN_API_KEY",
-			Destination: &mailgunAPIKey,
+			Usage:       "aws secret access key",
+			EnvVar:      "AWS_SECRET_ACCESS_KEY",
+			Destination: &awsSecretAccessKey,
+		},
+		cli.StringFlag{
+			Name:        "aws-region",
+			Value:       "",
+			Usage:       "aws region",
+			EnvVar:      "AWS_REGION",
+			Destination: &awsSecretAccessKey,
+		},
+		cli.StringFlag{
+			Name:        "log-level",
+			Value:       "info",
+			Usage:       "log level",
+			EnvVar:      "LOG_LEVEL",
+			Destination: &logLevel,
 		},
 	}
 
 	app.Action = func(c *cli.Context) error {
-		fmt.Printf("Server listening on port %d\n", port)
+		level, err := log.ParseLevel(logLevel)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.SetLevel(level)
+
+		if err := processEmailMapping(); err != nil {
+			log.Fatal(err)
+		}
+
+		log.Infof("smsproxy listening on port %d\n", port)
 		router := mux.NewRouter()
 		router.HandleFunc("/", index).Methods("GET")
-		router.HandleFunc("/messages", sendMessage).Methods("POST")
-		router.HandleFunc("/messages", receiveMessage).Methods("GET")
+		router.HandleFunc("/messages", doPostMessage).Methods("POST")
+		router.HandleFunc("/messages", doGetMessage).Methods("GET")
 		log.Fatal(http.ListenAndServe(":"+strconv.Itoa(port), router))
 		return nil
 	}
