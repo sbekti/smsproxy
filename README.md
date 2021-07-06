@@ -1,2 +1,2 @@
 # smsproxy
-Forwards incoming SMS to dongleproxy 
+Proxies SMS between GSM modem and email.
