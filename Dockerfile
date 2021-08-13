@@ -1,7 +1,7 @@
 FROM golang:latest AS builder
 
 ENV GO111MODULE=on \
-    CGO_ENABLED=1
+    CGO_ENABLED=0
 
 WORKDIR /build
 
@@ -26,9 +26,9 @@ RUN cp /build/main ./main
 # Optional: in case your application uses dynamic linking (often the case with CGO), 
 # this will collect dependent libraries so they're later copied to the final image
 # NOTE: make sure you honor the license terms of the libraries you copy and distribute
-RUN ldd main | tr -s '[:blank:]' '\n' | grep '^/' | \
-    xargs -I % sh -c 'mkdir -p $(dirname ./%); cp % ./%;'
-RUN mkdir -p lib64 && cp /lib64/ld-linux-x86-64.so.2 lib64/
+# RUN ldd main | tr -s '[:blank:]' '\n' | grep '^/' | \
+#     xargs -I % sh -c 'mkdir -p $(dirname ./%); cp % ./%;'
+# RUN mkdir -p lib64 && cp /lib64/ld-linux-x86-64.so.2 lib64/
 
 # Copy or create other directories/files your app needs during runtime.
 # E.g. this example uses /data as a working directory that would probably
