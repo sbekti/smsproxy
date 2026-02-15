@@ -6,3 +6,4 @@ on:
 jobs:
   build:
     uses: sbekti/.github/.github/workflows/docker-build.yml@main
+
