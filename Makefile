@@ -1,5 +1,5 @@
 build:
-	docker build -t shbekti/smsproxy:3.0.0 .
+	docker build -t ghcr.io/sbekti/smsproxy:latest .
 
 push:
-	docker push shbekti/smsproxy:3.0.0
+	docker push ghcr.io/sbekti/smsproxy:latest
